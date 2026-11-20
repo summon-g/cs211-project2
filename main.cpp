@@ -154,7 +154,7 @@ void list_breakpoint_command(set<int> &breakpoints)
   }
 }
 
-struct STMT *get_next_stmt(struct STMT *cur)
+struct STMT *get_next_stmt(struct STMT *cur, struct RAM *memory)
 {
   if (cur == nullptr)
     return nullptr;
@@ -167,11 +167,41 @@ struct STMT *get_next_stmt(struct STMT *cur)
   case STMT_FUNCTION_CALL:
     return cur->types.function_call->next_stmt;
 
-  case STMT_IF_THEN_ELSE:
-    return cur->types.if_then_else->next_stmt;
+  case STMT_IF_THEN_ELSE: {
+    struct RAM_VALUE *result = execute_expr(cur, memory, cur->types.if_then_else->condition);
 
-  case STMT_WHILE_LOOP:
-    return cur->types.while_loop->next_stmt;
+    if (result == nullptr) {     // condition eval failed
+        break;
+    }
+
+    if (result->types.i != 0) {  // if condition is true follow true path
+        cur = cur->types.if_then_else->true_path;
+    }
+    else {       // if condition is false follow false path
+        cur = cur->types.if_then_else->false_path;
+    }
+
+    ram_free_value(result);
+    break;
+  }
+
+  case STMT_WHILE_LOOP: {
+    struct RAM_VALUE* result = execute_expr(cur, memory, cur->types.while_loop->condition);
+
+    if (result == nullptr) {
+        break;
+    }
+
+    if (result->types.i != 0) {
+        cur = cur->types.while_loop->loop_body;
+    }
+    else {
+        cur = cur->types.while_loop->next_stmt;
+    }
+
+    ram_free_value(result);
+    break;
+  }
 
   case STMT_PASS:
     return cur->types.pass->next_stmt;
@@ -179,6 +209,8 @@ struct STMT *get_next_stmt(struct STMT *cur)
   default:
     return nullptr;
   }
+
+  return cur;
 }
 
 /**
@@ -240,7 +272,7 @@ void step_command(struct STMT *&cur, struct RAM *memory,
     return;
   }
 
-  cur = get_next_stmt(cur);
+  cur = get_next_stmt(cur, memory);
 
   at_breakpoint = (cur != nullptr &&
                    breakpoints.count(cur->line) > 0);
@@ -283,7 +315,7 @@ void run_program_command(struct STMT *&cur, struct RAM *memory,
       return;
     }
 
-    cur = get_next_stmt(current);
+    cur = get_next_stmt(current, memory);
   }
 
   cout << "Program has finished." << endl;
