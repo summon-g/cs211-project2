@@ -154,134 +154,132 @@ void list_breakpoint_command(set<int> &breakpoints)
   }
 }
 
-struct STMT *get_next_stmt(struct STMT *cur, struct RAM *memory)
-{
-  if (cur == nullptr)
-    return nullptr;
-
-  switch (cur->stmt_type)
-  {
-  case STMT_ASSIGNMENT:
-    return cur->types.assignment->next_stmt;
-
-  case STMT_FUNCTION_CALL:
-    return cur->types.function_call->next_stmt;
-
-  case STMT_IF_THEN_ELSE: {
-    struct RAM_VALUE *result = execute_expr(cur, memory, cur->types.if_then_else->condition);
-
-    if (result == nullptr) {     // condition eval failed
-        break;
-    }
-
-    if (result->types.i != 0) {  // if condition is true follow true path
-        cur = cur->types.if_then_else->true_path;
-    }
-    else {       // if condition is false follow false path
-        cur = cur->types.if_then_else->false_path;
-    }
-
-    ram_free_value(result);
-    break;
-  }
-
-  case STMT_WHILE_LOOP: {
-    struct RAM_VALUE* result = execute_expr(cur, memory, cur->types.while_loop->condition);
-
-    if (result == nullptr) {
-        break;
-    }
-
-    if (result->types.i != 0) {
-        cur = cur->types.while_loop->loop_body;
-    }
-    else {
-        cur = cur->types.while_loop->next_stmt;
-    }
-
-    ram_free_value(result);
-    break;
-  }
-
-  case STMT_PASS:
-    return cur->types.pass->next_stmt;
-
-  default:
-    return nullptr;
-  }
-
-  return cur;
-}
-
 /**
  * @brief what line will execute next command
  *
  * @return void
  */
-void next_line_command(struct STMT *cur)
+void where_command(struct STMT *cur)
 {
   if (cur == nullptr)
   {
-    cout << "Program has finished." << endl;
+    cout << "execution has completed" << endl;
     return;
   }
-  cout << "Next line is: " << cur->line << endl;
-  return;
+
+  // break the graph so only cur gets printed:
+  struct PG_LINKS links = break_pg(cur);
+  programgraph_print(cur);
+  repair_pg(cur, links);
 }
 
 /**
- * @brief executes exactly one stmt: breaks the program graph
- * after cur, executes cur, then repairs the graph
+ * @brief executes cur and sets next to the stmt that
+ *        should run after it
  *
- * @param cur stmt to execute
- * @param memory program memory
- * @return result of executing cur
+ * @return true if it worked, false on a semantic error
  */
-struct ExecuteResult execute_one_stmt(struct STMT *cur,
-                                      struct RAM *memory)
+bool execute_stmt(struct STMT *cur, struct RAM *memory, struct STMT *&next)
 {
+  //
+  // while loop: just check the condition:
+  //
+  if (cur->stmt_type == STMT_WHILE_LOOP)
+  {
+    struct RAM_VALUE *result =
+        execute_expr(cur, memory, cur->types.while_loop->condition);
+
+    if (result == nullptr) // condition eval failed
+      return false;
+
+    if (result->types.i != 0)
+      next = cur->types.while_loop->loop_body;
+    else
+      next = cur->types.while_loop->next_stmt;
+
+    ram_free_value(result);
+    return true;
+  }
+
+  //
+  // if stmt: just check the condition:
+  //
+  if (cur->stmt_type == STMT_IF_THEN_ELSE)
+  {
+    struct RAM_VALUE *result =
+        execute_expr(cur, memory, cur->types.if_then_else->condition);
+
+    if (result == nullptr) // condition eval failed
+      return false;
+
+    if (result->types.i != 0)
+      next = cur->types.if_then_else->true_path;
+    else
+      next = cur->types.if_then_else->false_path;
+
+    ram_free_value(result);
+    return true;
+  }
+
+  //
+  // everything else: break the graph, run just cur, repair:
+  //
   struct PG_LINKS links = break_pg(cur);
-
   struct ExecuteResult result = execute(cur, memory);
-
   repair_pg(cur, links);
 
-  return result;
+  if (!result.Success) // error message already printed
+    return false;
+
+  next = links.next;
+  return true;
 }
 
 /**
  * @brief step by executing the current statement command
  *
- * @return void
+ * @return true if we can keep going, false if not
  */
-void step_command(struct STMT *&cur, struct RAM *memory,
-                  set<int> &breakpoints, bool &at_breakpoint)
+bool step_command(struct STMT *&cur, struct RAM *memory,
+                  set<int> &breakpoints, bool &at_breakpoint,
+                  bool consume_input = true)
 {
   if (cur == nullptr)
   {
-    cout << "Program has finished." << endl;
-    return;
+    cout << "execution has completed" << endl;
+    return false;
   }
 
-  struct ExecuteResult result = execute_one_stmt(cur, memory);
-
-  if (!result.Success)
+  // stop at a breakpoint, unless we already stopped here:
+  if (!at_breakpoint && breakpoints.count(cur->line) > 0)
   {
-    cur = result.LastStmt;
-    at_breakpoint = false;
-    return;
+    at_breakpoint = true;
+    cout << "breakpoint hit at line " << cur->line << endl;
+    return false;
   }
 
-  cur = get_next_stmt(cur, memory);
+  // eat the rest of the line in case cur calls input():
+  if (consume_input)
+  {
+    string rest;
+    getline(cin, rest);
+  }
 
-  at_breakpoint = (cur != nullptr &&
-                   breakpoints.count(cur->line) > 0);
+  struct STMT *next = nullptr;
 
-  if (at_breakpoint)
-    cout << "Breakpoint at line " << cur->line << endl;
+  if (!execute_stmt(cur, memory, next))
+    return false; // leave cur at the stmt that failed
+
+  cur = next;
+  at_breakpoint = false;
 
   if (cur == nullptr)
-    cout << "Program has finished." << endl;
+  {
+    cout << "program completed" << endl;
+    return false;
+  }
+
+  return true;
 }
 
 /**
@@ -289,36 +287,17 @@ void step_command(struct STMT *&cur, struct RAM *memory,
  *
  * @return void
  */
-void run_program_command(struct STMT *&cur, struct RAM *memory,
-                         set<int> &breakpoints, bool &at_breakpoint)
+void run_command(struct STMT *&cur, struct RAM *memory,
+                 set<int> &breakpoints, bool &at_breakpoint)
 {
-  while (cur != nullptr)
+  // eat the rest of the line once before running:
+  string rest;
+  getline(cin, rest);
+
+  // keep stepping until done, error, or breakpoint:
+  while (step_command(cur, memory, breakpoints, at_breakpoint, false))
   {
-    if (at_breakpoint) // if we are on a bp
-    {
-      // pause
-      at_breakpoint = false;
-    }
-    else if (breakpoints.count(cur->line) > 0)
-    {
-      at_breakpoint = true;
-      cout << "Breakpoint at line " << cur->line << endl;
-      return;
-    }
-    struct STMT *current = cur;
-
-    struct ExecuteResult result = execute_one_stmt(current, memory);
-
-    if (!result.Success)
-    {
-      cur = result.LastStmt;
-      return;
-    }
-
-    cur = get_next_stmt(current, memory);
   }
-
-  cout << "Program has finished." << endl;
 }
 
 /**
@@ -363,21 +342,18 @@ int main(int argc, char *argv[])
     return 0;
   }
 
-  TokenQueue *tokens = parser_parse(input);
-  if (tokens == NULL)
+  //
+  // parse the program, parser prints its own error message:
+  //
+  struct TokenQueue *tokens = parser_parse(input);
+
+  if (tokens == nullptr)
   {
-    cout << "ERROR:An error occured while parsing." << endl;
     fclose(input);
     return 0;
   }
+
   struct STMT *program = programgraph_build(tokens);
-  if (program == NULL)
-  {
-    cout << "ERROR: An error occured while building the program." << endl;
-    tokenqueue_destroy(tokens);
-    fclose(input);
-    return 0;
-  }
   struct RAM *memory = ram_init();
   struct STMT *cur = program;
   set<int> breakpoints;
@@ -393,7 +369,8 @@ int main(int argc, char *argv[])
 
     cout << endl;
     cout << "Enter a command, h for help >" << endl;
-    cin >> cmd;
+    if (!(cin >> cmd)) // no more input, so quit
+      break;
 
     if (cmd == "q")
     {
@@ -436,7 +413,7 @@ int main(int argc, char *argv[])
     }
     else if (cmd == "w")
     {
-      next_line_command(cur);
+      where_command(cur);
     }
     else if (cmd == "s")
     {
@@ -444,7 +421,7 @@ int main(int argc, char *argv[])
     }
     else if (cmd == "r")
     {
-      run_program_command(cur, memory, breakpoints, at_breakpoint);
+      run_command(cur, memory, breakpoints, at_breakpoint);
     }
     else
     {

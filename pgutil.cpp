@@ -3,12 +3,10 @@
 /**
   * @brief program graph utility functions
   *
-  * @note SOLUTION
-  *
   * @author original template by Prof. Joe Hummel
-  * @author ?
-  * @author ?
-  * @author ?  
+  * @author Carson Apple
+  * @author Charlie Du
+  * @author Summon Gebrelibanos
   * @note Northwestern University
   */
 
@@ -73,12 +71,16 @@ struct PG_LINKS break_pg(struct STMT* cur)
     case STMT_IF_THEN_ELSE:
       links.true_path = cur->types.if_then_else->true_path;
       links.false_path = cur->types.if_then_else->false_path;
+      links.next = cur->types.if_then_else->next_stmt;
       cur->types.if_then_else->true_path = nullptr;
       cur->types.if_then_else->false_path = nullptr;
+      cur->types.if_then_else->next_stmt = nullptr;
+      break;
+
+    default: // nothing to break
       break;
   }
 
-  // maybe do some default in case we have an error
   return links;
 }
 
@@ -125,6 +127,10 @@ void repair_pg(struct STMT* cur, struct PG_LINKS links)
     case STMT_IF_THEN_ELSE:
       cur->types.if_then_else->true_path = links.true_path;
       cur->types.if_then_else->false_path = links.false_path;
+      cur->types.if_then_else->next_stmt = links.next;
+      break;
+
+    default: // nothing to repair
       break;
   }
 }
@@ -342,13 +348,15 @@ TEST(break_repair_pg, if_else)
   struct PG_LINKS links = break_pg(ifs);
   ASSERT_EQ(ifs->types.if_then_else->true_path, nullptr);
   ASSERT_EQ(ifs->types.if_then_else->false_path, nullptr);
-  ASSERT_EQ(ifs->types.if_then_else->next_stmt, next);  // left alone
+  ASSERT_EQ(ifs->types.if_then_else->next_stmt, nullptr);
   ASSERT_EQ(links.true_path, t);
   ASSERT_EQ(links.false_path, f);
+  ASSERT_EQ(links.next, next);
 
   repair_pg(ifs, links);
   ASSERT_EQ(ifs->types.if_then_else->true_path, t);
   ASSERT_EQ(ifs->types.if_then_else->false_path, f);
+  ASSERT_EQ(ifs->types.if_then_else->next_stmt, next);
 
   tokenqueue_destroy(tokens);
   programgraph_destroy(program);
@@ -387,6 +395,172 @@ TEST(break_repair_pg, step_executes_one_stmt)
 
   ram_free_value(v);
   ram_destroy(memory);
+  tokenqueue_destroy(tokens);
+  programgraph_destroy(program);
+}
+
+TEST(break_repair_pg, if_no_else)
+{
+  struct TokenQueue* tokens;
+  struct STMT* program = build_from(
+    "x = 3\n"
+    "if x > 0:\n"
+    "{\n"
+    "  y = 1\n"
+    "}\n"
+    "print(x)\n", tokens);
+
+  struct STMT* ifs = program->types.assignment->next_stmt;
+  ASSERT_EQ(ifs->stmt_type, STMT_IF_THEN_ELSE);
+
+  // save whatever the links are, no else means false_path
+  // may be nullptr or may point past the if:
+  struct STMT* t    = ifs->types.if_then_else->true_path;
+  struct STMT* f    = ifs->types.if_then_else->false_path;
+  struct STMT* next = ifs->types.if_then_else->next_stmt;
+  ASSERT_NE(t, nullptr);
+
+  struct PG_LINKS links = break_pg(ifs);
+  ASSERT_EQ(ifs->types.if_then_else->true_path, nullptr);
+  ASSERT_EQ(ifs->types.if_then_else->false_path, nullptr);
+  ASSERT_EQ(ifs->types.if_then_else->next_stmt, nullptr);
+  ASSERT_EQ(links.true_path, t);
+  ASSERT_EQ(links.false_path, f);
+  ASSERT_EQ(links.next, next);
+
+  repair_pg(ifs, links);
+  ASSERT_EQ(ifs->types.if_then_else->true_path, t);
+  ASSERT_EQ(ifs->types.if_then_else->false_path, f);
+  ASSERT_EQ(ifs->types.if_then_else->next_stmt, next);
+
+  tokenqueue_destroy(tokens);
+  programgraph_destroy(program);
+}
+
+TEST(break_repair_pg, last_stmt_in_loop_body)
+{
+  struct TokenQueue* tokens;
+  struct STMT* program = build_from(
+    "x = 3\n"
+    "while x > 0:\n"
+    "{\n"
+    "  y = x\n"
+    "  x = x - 1\n"
+    "}\n"
+    "print(x)\n", tokens);
+
+  struct STMT* loop = program->types.assignment->next_stmt;
+  ASSERT_EQ(loop->stmt_type, STMT_WHILE_LOOP);
+
+  struct STMT* first = loop->types.while_loop->loop_body;
+  struct STMT* last  = first->types.assignment->next_stmt;
+  ASSERT_EQ(last->stmt_type, STMT_ASSIGNMENT);
+
+  // last stmt in the body loops back to the while:
+  ASSERT_EQ(last->types.assignment->next_stmt, loop);
+
+  struct PG_LINKS links = break_pg(last);
+  ASSERT_EQ(last->types.assignment->next_stmt, nullptr);
+  ASSERT_EQ(links.next, loop);
+
+  repair_pg(last, links);
+  ASSERT_EQ(last->types.assignment->next_stmt, loop);
+
+  // the loop itself should be untouched:
+  ASSERT_EQ(loop->types.while_loop->loop_body, first);
+
+  tokenqueue_destroy(tokens);
+  programgraph_destroy(program);
+}
+
+TEST(break_repair_pg, if_elif_else)
+{
+  struct TokenQueue* tokens;
+  struct STMT* program = build_from(
+    "x = 3\n"
+    "if x < 1:\n"
+    "{\n"
+    "  y = 1\n"
+    "}\n"
+    "elif x < 10:\n"
+    "{\n"
+    "  y = 2\n"
+    "}\n"
+    "else:\n"
+    "{\n"
+    "  y = 3\n"
+    "}\n"
+    "print(y)\n", tokens);
+
+  struct STMT* outer = program->types.assignment->next_stmt;
+  ASSERT_EQ(outer->stmt_type, STMT_IF_THEN_ELSE);
+
+  // the elif is the outer if's false path:
+  struct STMT* inner = outer->types.if_then_else->false_path;
+  ASSERT_NE(inner, nullptr);
+  ASSERT_EQ(inner->stmt_type, STMT_IF_THEN_ELSE);
+
+  struct STMT* outer_t    = outer->types.if_then_else->true_path;
+  struct STMT* outer_next = outer->types.if_then_else->next_stmt;
+  struct STMT* inner_t    = inner->types.if_then_else->true_path;
+  struct STMT* inner_f    = inner->types.if_then_else->false_path;
+  struct STMT* inner_next = inner->types.if_then_else->next_stmt;
+
+  struct PG_LINKS links = break_pg(outer);
+  ASSERT_EQ(outer->types.if_then_else->true_path, nullptr);
+  ASSERT_EQ(outer->types.if_then_else->false_path, nullptr);
+  ASSERT_EQ(outer->types.if_then_else->next_stmt, nullptr);
+  ASSERT_EQ(links.true_path, outer_t);
+  ASSERT_EQ(links.false_path, inner);
+  ASSERT_EQ(links.next, outer_next);
+
+  // breaking the outer if should not touch the inner one:
+  ASSERT_EQ(inner->types.if_then_else->true_path, inner_t);
+  ASSERT_EQ(inner->types.if_then_else->false_path, inner_f);
+  ASSERT_EQ(inner->types.if_then_else->next_stmt, inner_next);
+
+  repair_pg(outer, links);
+  ASSERT_EQ(outer->types.if_then_else->true_path, outer_t);
+  ASSERT_EQ(outer->types.if_then_else->false_path, inner);
+  ASSERT_EQ(outer->types.if_then_else->next_stmt, outer_next);
+
+  ASSERT_EQ(inner->types.if_then_else->true_path, inner_t);
+  ASSERT_EQ(inner->types.if_then_else->false_path, inner_f);
+  ASSERT_EQ(inner->types.if_then_else->next_stmt, inner_next);
+
+  tokenqueue_destroy(tokens);
+  programgraph_destroy(program);
+}
+
+TEST(break_repair_pg, break_repair_twice)
+{
+  struct TokenQueue* tokens;
+  struct STMT* program = build_from(
+    "x = 3\n"
+    "while x > 0:\n"
+    "{\n"
+    "  x = x - 1\n"
+    "}\n"
+    "print(x)\n", tokens);
+
+  struct STMT* loop  = program->types.assignment->next_stmt;
+  struct STMT* body  = loop->types.while_loop->loop_body;
+  struct STMT* after = loop->types.while_loop->next_stmt;
+
+  // do it twice, second time should give the same links back:
+  for (int i = 0; i < 2; i++)
+  {
+    struct PG_LINKS links = break_pg(loop);
+    ASSERT_EQ(loop->types.while_loop->loop_body, nullptr);
+    ASSERT_EQ(loop->types.while_loop->next_stmt, nullptr);
+    ASSERT_EQ(links.loop_body, body);
+    ASSERT_EQ(links.next, after);
+
+    repair_pg(loop, links);
+    ASSERT_EQ(loop->types.while_loop->loop_body, body);
+    ASSERT_EQ(loop->types.while_loop->next_stmt, after);
+  }
+
   tokenqueue_destroy(tokens);
   programgraph_destroy(program);
 }
